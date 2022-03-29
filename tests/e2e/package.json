@@ -1,0 +1,13 @@
+{
+    "name": "bitstop-react-redux-ts-template-e2e-tests",
+    "version": "0.1.0",
+    "private": true,
+    "scripts": {
+        "cypress": "cypress open",
+        "cypress:headless": "cypress run --browser chrome --headless"
+    },
+    "devDependencies": {
+        "@testing-library/cypress": "^8.0.2",
+        "cypress": "^9.2.1"
+    }
+}

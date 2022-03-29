@@ -1,0 +1,54 @@
+version: '3'
+
+# Allows these services to be compatible with existing nonce services (mesh)
+networks:
+  nonce-services:
+    external: true
+
+services:
+  bitstop-frontend-template:                  # Change to service name
+    container_name: bitstop-frontend-template # Change to service name
+    build:
+      dockerfile: Dockerfile
+      context: .
+    restart: unless-stopped
+    ports:
+      - 55001:55001                             # Set service ports
+    networks:
+      - nonce-services
+    environment:
+      PORT: 55001
+
+  bitstop-frontend-template-ci:                  # Change to service name
+    container_name: bitstop-frontend-template-ci # Change to service name
+    image: $DOCKERHUB_REPO_ROOT/$SERVICE_NAME:${CIRCLE_SHA1}
+    restart: "no"
+    ports:
+      - 55001:55001                             # Set service ports
+    networks:
+      - nonce-services
+    environment:
+      PORT: 55001
+
+  e2e:
+    image: e2e
+    build: ./tests/e2e
+    container_name: e2e
+    depends_on:
+      - bitstop-frontend-template-ci
+    environment:
+      - BROWSERSLIST_IGNORE_OLD_DATA=1
+      - CYPRESS_baseUrl=http://bitstop-frontend-template-ci:55001
+    command: npx cypress run --browser chrome --headless
+    networks:
+    - nonce-services
+    # mount the host directory e2e/cypress and the file e2e/cypress.json as
+    # volumes within the container
+    # this means that:
+    #  1. anything that Cypress writes to these folders (e.g., screenshots,
+    #     videos) appears also on the Docker host's filesystem
+    #  2. any change that the developer applies to Cypress files on the host
+    #     machine immediately takes effect within the e2e container (no docker
+    #     rebuild required).
+    volumes:
+      - ./tests/e2e/cypress:/app/cypress

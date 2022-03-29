@@ -1,0 +1,244 @@
+version: 2.1
+
+executors:
+  cypress:
+    docker:
+    - image: cypress/base:14.16.0
+  kubernetes_deployment_agent:
+    environment:
+      SERVICE_NAME: bitstop-react-redux-ts-template
+    docker:
+      - image: $DOCKERHUB_REPO_ROOT/kubeagent:v1.1.4-$ENV_NAME
+        auth:
+          username: $REGISTRY_USERNAME
+          password: $REGISTRY_PASSWORD
+
+commands:
+  test_e2e:
+    steps:
+    - run:
+        name: Run E2E
+        command: make docker.run.ci
+    - store_test_results:
+        path: tests/e2e/cypress/results
+    - store_artifacts:
+        path: tests/e2e/cypress/results
+    - store_artifacts:
+        path: tests/e2e/cypress/videos
+    - store_artifacts:
+        path: tests/e2e/cypress/screenshots
+
+  docker_login:
+      steps:
+        - run:
+            name: Login to Docker Hub
+            command: |
+              echo $REGISTRY_PASSWORD | docker login -u $REGISTRY_USERNAME --password-stdin https://nonce.services
+
+  docker_build:
+    steps:
+      - run:
+          name: Build docker image
+          command: |
+            docker build -t $DOCKERHUB_REPO_ROOT/$SERVICE_NAME:${CIRCLE_SHA1} -t $DOCKERHUB_REPO_ROOT/$SERVICE_NAME:latest .
+
+  docker_push:
+    steps:
+      - run:
+          name: Push docker image to hub
+          command: docker push $DOCKERHUB_REPO_ROOT/$SERVICE_NAME --all-tags
+
+  docker_pull:
+    steps:
+      - run:
+          name: Pull docker image from hub
+          command: docker pull $DOCKERHUB_REPO_ROOT/$SERVICE_NAME:${CIRCLE_SHA1}
+
+  apply_kubernetes_deployment:
+    steps:
+      - run:
+          name: Apply kube file configurations
+          command: |
+            kubectl apply -f "./.kubernetes/"
+      - run:
+          # This is annoying but I have not found a better way to do configuration yet (variable replacement)
+          name: Apply deployment file using git sha1 as tag
+          command: |
+            cat \<<EOF | kubectl apply -f -
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: ${SERVICE_NAME}
+              namespace: ${NAMESPACE}
+              labels:
+                app: ${NAMESPACE}
+                service_name: ${SERVICE_NAME}
+            spec:
+              replicas: ${REPLICAS}
+              progressDeadlineSeconds: 180
+              strategy:
+                rollingUpdate:
+                  maxSurge: 1
+                  maxUnavailable: 1
+              selector:
+                matchLabels:
+                  app: ${NAMESPACE}
+                  service_name: ${SERVICE_NAME}
+              template:
+                metadata:
+                  labels:
+                    app: ${NAMESPACE}
+                    service_name: ${SERVICE_NAME}
+                spec:
+                  containers:
+                  - name: ${SERVICE_NAME}
+                    image: ${DOCKERHUB_REPO_ROOT}/${SERVICE_NAME}:${CIRCLE_SHA1}
+                    env:
+                    - name: PORT
+                      value: "55001"
+                    envFrom:
+                    - secretRef:
+                        name: papertrail-serilog
+                    - secretRef:
+                        name: seq-ingest
+                    - configMapRef:
+                        name: services-dns
+                    securityContext:
+                        runAsUser: 1000
+                        allowPrivilegeEscalation: false
+                    # resources:
+                    #   requests:
+                    #     cpu: ${REQUESTS_CPU}
+                    #     memory: ${REQUESTS_MEMORY}
+                    #   limits:
+                    #     memory: ${LIMITS_MEMORY}
+                    #     cpu: ${LIMITS_CPU}
+                    ports:
+                    - containerPort: 55001
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 55001
+                      initialDelaySeconds: 10
+                      periodSeconds: 60
+                  imagePullSecrets:
+                  - name: ${DOCKERHUB_REPO_ROOT}
+                  terminationGracePeriodSeconds: 30
+                  restartPolicy: Always
+            EOF
+  deploy_to_kubernetes:
+    steps:
+      - apply_kubernetes_deployment
+      - run:
+          name: Monitor kubernetes deployment rollout
+          command: |
+            kubectl rollout status deployment/${SERVICE_NAME} -n ${NAMESPACE}
+
+jobs:
+  build_and_push_image_to_dockerhub:
+    machine:
+      image: ubuntu-2004:202104-01
+      docker_layer_caching: true
+    environment:
+      SERVICE_NAME: bitstop-react-redux-ts-template
+    working_directory: ~/bitstop-react-redux-ts-template
+    steps:
+    - checkout
+    - docker_login
+    - attach_workspace:
+        at: /tmp/workspace
+    - docker_build
+    - run:
+        name: Archive Docker image
+        command: docker save -o image.tar $DOCKERHUB_REPO_ROOT/$SERVICE_NAME
+    - persist_to_workspace:
+          root: .
+          paths:
+            - ./image.tar
+    - store_artifacts:
+        path: ./image.tar
+        destination: Docker
+    - docker_push
+
+  test_e2e:
+    machine:
+      image: ubuntu-2004:202104-01
+      docker_layer_caching: true
+    working_directory: ~/bitstop-react-redux-ts-template-tests
+    environment:
+      TERM: xterm
+      SERVICE_NAME: bitstop-react-redux-ts-template
+    steps:
+      - checkout
+      - docker_login
+      - docker_pull
+      - test_e2e
+
+  deploy_to_kubernetes:
+    executor: kubernetes_deployment_agent
+    working_directory: ~/bitstop-react-redux-ts-template
+    steps:
+      - checkout
+      - deploy_to_kubernetes
+
+workflows:
+  version: 2
+  not_trunk:
+    jobs:
+    - build_and_push_image_to_dockerhub:
+          filters: &filters-branches-not-develop
+            branches:
+              ignore: develop
+          context:
+          - docker
+    - test_e2e:
+        filters:
+          <<: *filters-branches-not-develop
+        requires:
+          - build_and_push_image_to_dockerhub
+        context:
+        - docker
+
+  cicd:
+    jobs:
+      - build_and_push_image_to_dockerhub:
+          filters: &filters-branches-develop
+            branches:
+              only: develop
+          context:
+          - docker
+      - test_e2e:
+          filters:
+            <<: *filters-branches-develop
+          requires:
+            - build_and_push_image_to_dockerhub
+          context:
+          - docker
+      - deploy_to_kubernetes:
+          name: Deploy to Testnet
+          filters:
+            <<: *filters-branches-develop
+          requires:
+            - test_e2e
+          context:
+            - docker
+            - kubernetes
+            - testnet
+            - bitstop-frontend-template-testnet
+      - hold:
+          filters:
+            <<: *filters-branches-develop
+          type: approval
+          requires:
+            - Deploy to Testnet
+      - deploy_to_kubernetes:
+          name: Deploy to Production
+          filters:
+            <<: *filters-branches-develop
+          requires:
+            - hold
+          context:
+            - docker
+            - kubernetes
+            - mainnet
+            - bitstop-frontend-template-mainnet
